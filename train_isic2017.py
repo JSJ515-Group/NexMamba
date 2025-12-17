@@ -1,0 +1,523 @@
+
+from __future__ import annotations
+import os
+from os.path import join
+from collections import defaultdict
+import torch
+import numpy as np
+import monai
+from monai import data
+from monai.metrics import CumulativeAverage
+import lightning as L
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
+from loguru import logger
+from lr_scheduler import LR_SCHEDULERS
+from loss import LOSSES
+from eval_1 import eval_single_volume_isic2017
+from model import build_model
+# <-- 使用你刚才的 Albumentations 版本 Dataset 模块
+from dataset_isic2017 import  ISICDataset
+from typing import Callable
+import logging
+
+torch.set_float32_matmul_precision("medium")
+device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+OPTIMIZERS = {
+    "Adam": torch.optim.Adam,
+    "SGD": torch.optim.SGD,
+    "RMSprop": torch.optim.RMSprop,
+    "AdamW": torch.optim.AdamW
+}
+
+
+class ISIC(L.LightningModule):
+    def __init__(self, name: str) -> None:
+        super(ISIC, self).__init__()
+        self.name = name
+        self.num_classes = 2      # 背景 + 病变
+        self.max_epochs = 150
+        self.freeze_encoder_epochs = 10
+        self.deep_supervision = False
+
+        # 模型构建（3通道RGB输入）
+        self._model = build_model(
+            in_channels=3,
+            num_classes=self.num_classes,
+        ).to(device)
+
+        self.build_loss()
+        self.tl_metric = CumulativeAverage()
+        self.vs_metric = defaultdict(lambda: defaultdict(list))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._model(x)
+
+
+    def prepare_data(self) -> None:
+        """
+        注意：
+        - 新的 ISICDataset 假定传入的是每个 split 的 root 目录，
+          该目录下应包含 images/ 和 masks/ 子目录。
+        - 例如： dataset/isic2017/train/images  dataset/isic2017/train/masks
+        """
+        # 训练/验证数据集（Dataset 内已经做了 normalize）
+        self.train_dataset = ISICDataset(
+            root="dataset/isic2017/train",
+            split='train',
+            img_size=256,
+            file_list=None
+        )
+
+        self.val_dataset = ISICDataset(
+            root="dataset/isic2017/val",
+            split='val',
+            img_size=256,
+            file_list=None
+        )
+
+    def train_dataloader(self) -> data.DataLoader:
+        tdl = {
+            "batch_size": 16, #32  # RGB 图像建议较小 batch
+            "num_workers": 2,#6
+            "shuffle": True,
+            "pin_memory": True,
+            "persistent_workers": True
+        }
+        logger.info(f"Training dataloader: {tdl}")
+        # 使用 Dataset 提供的 collate_fn
+        return data.DataLoader(self.train_dataset, collate_fn=ISICDataset.collate_fn, **tdl)
+
+    def val_dataloader(self) -> data.DataLoader:
+        vdl = {
+            "batch_size": 1,
+            "shuffle": False,
+            "num_workers": 2,
+            "pin_memory": True,
+            "persistent_workers": True
+        }
+        logger.info(f"Validation dataloader: {vdl}")
+        return data.DataLoader(self.val_dataset, collate_fn=ISICDataset.collate_fn, **vdl)
+
+
+    def build_loss(self):
+        loss_0 = ("DiceCELoss", {
+            "ce_weight": 0.4,
+            "dc_weight": 0.6,
+            "ce_class_weights": None,
+            "dc_class_weights": None
+        })
+        self.loss = LOSSES[loss_0[0]](**loss_0[1])
+
+    @property
+    def criterion(self) -> Callable[..., torch.Tensor]:
+        return self.loss
+
+    def configure_optimizers(self) -> dict:
+        optimizer_0 = ("AdamW", {
+            "lr": 1e-4,   # RGB任务稍低学习率更稳
+            "weight_decay": 1e-4,
+            "eps": 1e-8,
+            "amsgrad": False,
+            "betas": (0.9, 0.999)
+        })
+        optimizer = OPTIMIZERS[optimizer_0[0]](self._model.parameters(), **optimizer_0[1])
+
+        scheduler_1 = ("CosineAnnealingLR", {
+            "T_max": self.max_epochs,
+            "eta_min": 1e-6
+        })
+        scheduler = LR_SCHEDULERS[scheduler_1[0]](optimizer, **scheduler_1[1])
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": scheduler
+        }
+
+    def log_and_logger(self, name: str, value: ..., **kwargs: ...) -> None:
+        self.log(name, value, **kwargs)
+        logger.info(f"{name}: {value}")
+
+    def on_train_epoch_start(self) -> None:
+        if self.current_epoch < self.freeze_encoder_epochs:
+            # 你的 model 需要提供 freeze_encoder / unfreeze_encoder 接口
+            self._model.freeze_encoder()
+        else:
+            self._model.unfreeze_encoder()
+        super().on_train_epoch_start()
+
+    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        # Dataset 返回 'image' (B,C,H,W) and 'label' (B,H,W)
+        image, label = batch["image"].to(device), batch["label"].to(device)
+        pred = self.forward(image)
+        loss = self.criterion(pred, label)
+
+        self.log("loss", loss.item(), prog_bar=True)
+        self.tl_metric.append(loss.item())
+        # log lr if optimizer exists
+        optim = self.optimizers()
+        if optim is not None:
+            self.log("lr", optim.param_groups[0]["lr"], prog_bar=True)
+        return loss
+
+    def on_train_epoch_end(self) -> None:
+        tl = self.tl_metric.aggregate().item()
+        self.log_and_logger("mean_train_loss", tl)
+        self.tl_metric.reset()
+
+    def validation_step(self, batch: dict[str, torch.Tensor]) -> None:
+        volume, label = batch["image"], batch["label"]
+        metric = eval_single_volume_isic2017(
+            model=self._model,
+            volume=volume,
+            label=label,
+            num_classes=self.num_classes,
+            output=join(self.name, str(self.current_epoch)),
+            patch_size=(256,256),
+            device=device,
+            norm_x_transform=None,   # Dataset 已经归一化
+        )
+
+        for metric_name, class_metric in metric.items():
+            for class_name, value in class_metric.items():
+                self.vs_metric[metric_name][class_name].append(np.mean(value))
+
+    def on_validation_epoch_end(self) -> None:
+        for metric_name, class_metric in self.vs_metric.items():
+            avg_metric = []
+            for class_name, value in class_metric.items():
+                t = np.mean(value)
+                self.log(f"val_{metric_name}_{class_name}", t)
+                avg_metric.append(t)
+            self.log_and_logger(f"val_mean_{metric_name}", np.mean(avg_metric))
+        self.vs_metric = defaultdict(lambda: defaultdict(list))
+
+
+def train(name: str) -> None:
+    os.makedirs(name, exist_ok=True)
+    logger.add(join(name, "train.log"))
+
+    model = ISIC(name)
+
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=join(name, "checkpoints"),
+        monitor="val_mean_dice",
+        mode="max",
+        filename="{epoch:02d}-{val_mean_dice:.4f}",
+        save_last=True
+    )
+
+    early_stop_callback = EarlyStopping(
+        monitor="mean_train_loss",
+        mode="min",
+        min_delta=0.00,
+        patience=15
+    )
+
+    trainer = L.Trainer(
+        precision=32,
+        accelerator=device,
+        devices="auto",
+        max_epochs=model.max_epochs,
+        check_val_every_n_epoch=10,
+        gradient_clip_val=1.0,
+        default_root_dir=name,
+        callbacks=[checkpoint_callback, early_stop_callback],
+        enable_checkpointing=True
+    )
+
+    trainer.fit(model, ckpt_path=None)
+
+
+if __name__ == "__main__":
+    L.seed_everything(42)
+    monai.utils.set_determinism(42)
+    train("log/msvm-unet-isic")
+
+
+
+
+
+
+
+
+
+# from __future__ import annotations
+# import os
+# from os.path import join
+# from collections import defaultdict
+# import torch
+# import numpy as np
+# import monai
+# from monai import data
+# from monai.metrics import CumulativeAverage
+# import lightning as L
+# from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
+# from loguru import logger
+# from lr_scheduler import LR_SCHEDULERS
+# from loss import LOSSES
+# from eval_1 import eval_single_volume_isic2017
+# from model import build_model
+# from dataset_isic2017 import ISICDataset# RandomGenerator   # ✅ 替换成你的 ISIC 数据集类
+# from typing import Callable
+# from torchvision import transforms
+# import logging
+#
+# torch.set_float32_matmul_precision("medium")
+# device: str = "cuda" if torch.cuda.is_available() else "cpu"
+#
+# OPTIMIZERS = {
+#     "Adam": torch.optim.Adam,
+#     "SGD": torch.optim.SGD,
+#     "RMSprop": torch.optim.RMSprop,
+#     "AdamW": torch.optim.AdamW
+# }
+#
+#
+# class ISIC(L.LightningModule):
+#     def __init__(self, name: str) -> None:
+#         super(ISIC, self).__init__()
+#         self.name = name
+#         self.num_classes = 2      # ✅ 背景 + 病变
+#         self.max_epochs = 300
+#         self.freeze_encoder_epochs = 10
+#         self.deep_supervision = False
+#
+#         # ✅ 模型构建（3通道RGB输入）
+#         self._model = build_model(
+#             in_channels=3,
+#             num_classes=self.num_classes,
+#         ).to(device)
+#
+#         self.build_loss()
+#         self.tl_metric = CumulativeAverage()
+#         self.vs_metric = defaultdict(lambda: defaultdict(list))
+#
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         return self._model(x)
+#
+#
+#
+#     def prepare_data(self) -> None:
+#         # 定义可选的标准化/归一化变换
+#         norm_x_transform = transforms.Compose([
+#             # 注意这里输入是 Tensor [C,H,W]
+#             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+#         ])
+#
+#         self.train_dataset = ISICDataset(
+#             base_dir="dataset/isic2017/train",
+#             img_size=224,
+#             split='train',
+#             # norm_x_transform=norm_x_transform  # 可选
+#         )
+#
+#         self.val_dataset = ISICDataset(
+#             base_dir="dataset/isic2017/val",
+#             img_size=224,
+#             split='val',
+#             # norm_x_transform=norm_x_transform  # 可选，保证训练与验证一致
+#         )
+#     # def prepare_data(self) -> None:
+#     #     # transforms = RandomGenerator(output_size=(224, 224);
+#     #     self.train_dataset = ISICDataset(
+#     #         base_dir="dataset/isic2017/train",
+#     #         img_size=256,
+#     #         split='train'
+#     #     )
+#     #
+#     #     self.val_dataset = ISICDataset(
+#     #         base_dir="dataset/isic2017/val",
+#     #         img_size=256,
+#     #         split='val'
+#     #     )
+#         # self.norm_x_transform = transforms.Compose([
+#         #     transforms.ToTensor(),
+#         #     transforms.Normalize([0.5], [0.5])
+#         # ])
+#         #
+#         # # 训练集
+#         # self.train_dataset = ISICDataset(
+#         #     base_dir="dataset/isic2017/train",
+#         #     # split="train",
+#         #     transform=self.norm_x_transform
+#         # )
+#         #
+#         # # 验证集
+#         # self.val_dataset = ISICDataset(
+#         #     base_dir="dataset/isic2017/val",
+#         #     # split="val",
+#         #     transform=self.norm_x_transform
+#         # )
+#
+#     # def prepare_data(self) -> None:
+#     #     # ✅ 数据增强器（你写的 RandomGenerator）
+#     #     transform = RandomGenerator(output_size=(224, 224))
+#     #
+#     #     self.train_dataset = ISICDataset(
+#     #         base_dir="dataset/isic2017/train",
+#     #         list_dir="./lists/lists_ISIC",
+#     #         split="train",
+#     #         transform=transform
+#     #     )
+#     #
+#     #     self.val_dataset = ISICDataset(
+#     #         base_dir="dataset/isic2017/val",
+#     #         list_dir="./lists/lists_ISIC",
+#     #         split="val",  # ✅ 使用验证集
+#     #         transform=RandomGenerator((224, 224))
+#     #     )
+#
+#     def train_dataloader(self) -> data.DataLoader:
+#         tdl = {
+#             "batch_size": 16,   # ✅ RGB图像建议小点
+#             "num_workers": 2,
+#             "shuffle": True,
+#             "pin_memory": True,
+#             "persistent_workers": True
+#         }
+#         logger.info(f"Training dataloader: {tdl}")
+#         return data.DataLoader(self.train_dataset, collate_fn=ISICDataset.collate_fn, **tdl)
+#
+#     def val_dataloader(self) -> data.DataLoader:
+#         vdl = {
+#             "batch_size": 1,
+#             "shuffle": False,
+#             "num_workers": 2,
+#             "pin_memory": True,
+#             "persistent_workers": True
+#         }
+#         logger.info(f"Validation dataloader: {vdl}")
+#         return data.DataLoader(self.val_dataset, collate_fn=ISICDataset.collate_fn, **vdl)
+#
+#
+#
+#
+#     def build_loss(self):
+#         loss_0 = ("DiceCELoss", {
+#             "ce_weight": 0.4,
+#             "dc_weight": 0.6,
+#             "ce_class_weights": None,
+#             "dc_class_weights": None
+#         })
+#         self.loss = LOSSES[loss_0[0]](**loss_0[1])
+#
+#     @property
+#     def criterion(self) -> Callable[..., torch.Tensor]:
+#         return self.loss
+#
+#     def configure_optimizers(self) -> dict:
+#         optimizer_0 = ("AdamW", {
+#             "lr": 1e-4,   # ✅ RGB任务稍低学习率更稳
+#             "weight_decay": 1e-4,
+#             "eps": 1e-8,
+#             "amsgrad": False,
+#             "betas": (0.9, 0.999)
+#         })
+#         optimizer = OPTIMIZERS[optimizer_0[0]](self._model.parameters(), **optimizer_0[1])
+#
+#         scheduler_1 = ("CosineAnnealingLR", {
+#             "T_max": self.max_epochs,
+#             "eta_min": 1e-6
+#         })
+#         scheduler = LR_SCHEDULERS[scheduler_1[0]](optimizer, **scheduler_1[1])
+#
+#         return {
+#             "optimizer": optimizer,
+#             "lr_scheduler": scheduler
+#         }
+#
+#     def log_and_logger(self, name: str, value: ..., **kwargs: ...) -> None:
+#         self.log(name, value, **kwargs)
+#         logger.info(f"{name}: {value}")
+#
+#     def on_train_epoch_start(self) -> None:
+#         if self.current_epoch < self.freeze_encoder_epochs:
+#             self._model.freeze_encoder()
+#         else:
+#             self._model.unfreeze_encoder()
+#         super().on_train_epoch_start()
+#
+#     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+#         image, label = batch["image"].to(device), batch["label"].to(device)
+#         pred = self.forward(image)
+#         loss = self.criterion(pred, label)
+#
+#         self.log("loss", loss.item(), prog_bar=True)
+#         self.tl_metric.append(loss.item())
+#         self.log("lr", self.optimizers().param_groups[0]["lr"], prog_bar=True)
+#         return loss
+#
+#     def on_train_epoch_end(self) -> None:
+#         tl = self.tl_metric.aggregate().item()
+#         self.log_and_logger("mean_train_loss", tl)
+#         self.tl_metric.reset()
+#
+#     def validation_step(self, batch: dict[str, torch.Tensor]) -> None:
+#         volume, label = batch["image"], batch["label"]
+#         metric = eval_single_volume_isic2017(
+#             model=self._model,
+#             volume=volume,
+#             label=label,
+#             num_classes=self.num_classes,
+#             output=join(self.name, str(self.current_epoch)),
+#             patch_size=(224,224),
+#             device=device,
+#             norm_x_transform=None,
+#         )
+#
+#         for metric_name, class_metric in metric.items():
+#             for class_name, value in class_metric.items():
+#                 self.vs_metric[metric_name][class_name].append(np.mean(value))
+#
+#     def on_validation_epoch_end(self) -> None:
+#         for metric_name, class_metric in self.vs_metric.items():
+#             avg_metric = []
+#             for class_name, value in class_metric.items():
+#                 t = np.mean(value)
+#                 self.log(f"val_{metric_name}_{class_name}", t)
+#                 avg_metric.append(t)
+#             self.log_and_logger(f"val_mean_{metric_name}", np.mean(avg_metric))
+#         self.vs_metric = defaultdict(lambda: defaultdict(list))
+#
+#
+# def train(name: str) -> None:
+#     os.makedirs(name, exist_ok=True)
+#     logger.add(join(name, "train.log"))
+#
+#     model = ISIC(name)
+#
+#     checkpoint_callback = ModelCheckpoint(
+#         dirpath=join(name, "checkpoints"),
+#         monitor="val_mean_dice",
+#         mode="max",
+#         filename="{epoch:02d}-{val_mean_dice:.4f}",
+#         save_last=True
+#     )
+#
+#     early_stop_callback = EarlyStopping(
+#         monitor="mean_train_loss",
+#         mode="min",
+#         min_delta=0.00,
+#         patience=15
+#     )
+#
+#     trainer = L.Trainer(
+#         precision=32,
+#         accelerator=device,
+#         devices="auto",
+#         max_epochs=model.max_epochs,
+#         check_val_every_n_epoch=10,
+#         gradient_clip_val=1.0,
+#         default_root_dir=name,
+#         callbacks=[checkpoint_callback, early_stop_callback],
+#         enable_checkpointing=True
+#     )
+#
+#     trainer.fit(model, ckpt_path=None)
+#
+#
+# if __name__ == "__main__":
+#     L.seed_everything(42)
+#     monai.utils.set_determinism(42)
+#     train("log/msvm-unet-isic")

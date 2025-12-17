@@ -1,0 +1,40 @@
+#必须要注意head哪里定义了输出图片的尺寸，默认是224*224，有必要记得修改为目标张量
+#这里使用的ISIC,都是使用dataset_isic2017.py
+#数据集下载问题
+#Synapse和ACDC,以及预训练权重:https://github.com/gndlwch2w/msvm-unet
+#ISIC2017/ISIC2018:https://github.com/JCruan519/VM-UNet
+        # $DATASET_HOME/
+        # └── mis/
+    #     ├── synapse /
+    #     │   ├── train /
+    #     │   └── test /
+    #     └── acdc /
+    #     | ├── train /
+    #     | ├── valid /
+    #     | └── test /
+    #     |
+    #     └── ISIC/
+    # 	├── train /
+    # 	├── valid /
+
+
+causal-conv1d==1.1.1
+mamba-ssm
+h5py==3.10.0
+loguru==0.7.2
+SimpleITK
+medpy
+tensorboardX
+ml_collections
+albumentations
+torchinfo
+timm
+numba
+lightning
+monai
+opencv-python
+einops
+fvcore
+imgaug
+grad-cam
+calflops
